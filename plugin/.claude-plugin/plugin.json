@@ -1,0 +1,8 @@
+{
+  "name": "story",
+  "version": "0.2.0",
+  "description": "Take part in Story from your own Claude Code: join a story from its link, get your part and the news as each session starts, and keep the people on the story informed as you work.",
+  "author": {"name": "Story", "url": "https://trystory.app"},
+  "homepage": "https://trystory.app",
+  "keywords": ["story", "collaboration", "agents"]
+}

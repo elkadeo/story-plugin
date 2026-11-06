@@ -1,0 +1,3 @@
+extend = "../pyproject.toml"
+# The plugin runs on the Mac's own python3 (3.9), with nothing installed.
+target-version = "py39"
