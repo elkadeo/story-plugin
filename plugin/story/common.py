@@ -32,7 +32,7 @@ try:  # a file lock where there is one (macOS, Linux); without it, hooks may rac
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 SERVICE = "Story"
 PERSON = "person"
 TIMEOUT = 10.0
@@ -244,14 +244,15 @@ def pull_request_of(cwd: str) -> str | None:
 
 
 def agent_here(state: dict[str, Any], folder: str) -> dict[str, Any] | None:
-    """This folder's agent and its key, if it has one."""
+    """This folder's agent, its key, and the Story it's in (`base`), if it has one."""
     found = state["folders"].get(folder)
-    if not found:
+    base = base_url(state, folder)
+    if not found or not base:
         return None
     key = get_secret(agent_account(found["card_id"]))
     if not key:
         return None
-    return dict(found, key=key)
+    return dict(found, key=key, base=base)
 
 
 def computer_name() -> str:
@@ -287,9 +288,48 @@ def under_an_old_bridge() -> bool:
 # ------------------------------------------------------------------ talking to Story
 
 
-def base_url(state: dict[str, Any] | None = None) -> str | None:
-    found = os.environ.get("STORY_URL") or (state or load_state()).get("base_url")
+# One computer can be in more than one Story (Logan, 2026-11-08: his Mac's own Story, and
+# app.trystory.app). Each folder's agent is in one Story, kept as the folder's `base_url`. The
+# first Story this computer joined is the state's own `base_url`, and folders joined before
+# 2026-11-08 have none of their own, so they stay in it. The person signs in to each Story apart:
+# the first one's sign-in is `person`, as before, and each other's is kept under its address.
+
+
+def base_url(state: dict[str, Any] | None = None, folder: str | None = None) -> str | None:
+    """Where Story is: STORY_URL if it's set; else the folder's own Story, if it has one; else
+    the first Story this computer joined."""
+    state = state or load_state()
+    found = os.environ.get("STORY_URL")
+    if not found and folder is not None:
+        found = (state["folders"].get(folder) or {}).get("base_url")
+    found = found or state.get("base_url")
     return found.rstrip("/") if found else None
+
+
+def first_story(state: dict[str, Any], base: str) -> bool:
+    """Whether `base` is the first Story this computer joined (or none is joined yet)."""
+    return not state.get("base_url") or state["base_url"].rstrip("/") == base.rstrip("/")
+
+
+def person_account(state: dict[str, Any], base: str) -> str:
+    """Where the person's sign-in to this Story is kept."""
+    if first_story(state, base):
+        return PERSON
+    return PERSON + ":" + re.sub(r"[^A-Za-z0-9.-]", "_", re.sub(r"^https?://", "", base))
+
+
+def story_place(state: dict[str, Any], base: str) -> dict[str, Any]:
+    """Where the person's name in this Story, and a connection not yet approved, are kept: the
+    state itself for the first Story, as before, else the Story's own entry."""
+    if first_story(state, base):
+        return state
+    found: dict[str, Any] = state.setdefault("storys", {}).setdefault(base.rstrip("/"), {})
+    return found
+
+
+def story_name(base: str) -> str:
+    """A Story's address as a person reads it: app.trystory.app."""
+    return re.sub(r"^https?://", "", base).split("/")[0]
 
 
 # Where a Mac keeps the certificates every HTTPS site is checked against. Python from python.org
@@ -351,8 +391,10 @@ def api(
     token: str | None = None,
     timeout: float = TIMEOUT,
     state: dict[str, Any] | None = None,
+    base: str | None = None,
 ) -> tuple[int, Any]:
-    base = base_url(state)
+    """A call to Story's API: to `base`, else to where `base_url` says Story is."""
+    base = base or base_url(state)
     if not base:
         return 0, {"error": {"code": "no_story", "message": "Not joined to Story yet."}}
     return call(method, base + "/v1" + path, body, token, timeout)

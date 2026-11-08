@@ -56,10 +56,7 @@ def context(event: str, words: str) -> None:
 
 def agent_and_session(given: dict[str, Any]) -> tuple:
     cwd = common.project_dir(given.get("cwd"))
-    state = common.load_state()
-    if not common.base_url(state):
-        return cwd, None, None
-    agent = common.agent_here(state, common.folder_of(cwd))
+    agent = common.agent_here(common.load_state(), common.folder_of(cwd))
     return cwd, agent, given.get("session_id")
 
 
@@ -71,7 +68,12 @@ def session_start(given: dict[str, Any]) -> None:
     if agent is None or not session_id or common.under_an_old_bridge():
         return
     brief = open_session(
-        cwd, session_id, agent["key"], woken=common.woken(), woken_for=common.woken_for()
+        cwd,
+        session_id,
+        agent["key"],
+        base=agent["base"],
+        woken=common.woken(),
+        woken_for=common.woken_for(),
     )
     if brief:
         context("SessionStart", brief)
@@ -88,7 +90,11 @@ def updates(given: dict[str, Any], event: str, throttle: bool) -> None:
         kept["checked"] = common.now()
         common.save_session(session_id, kept)
     status, body = common.api(
-        "GET", f"/me/sessions/{session_id}/updates", token=agent["key"], timeout=5
+        "GET",
+        f"/me/sessions/{session_id}/updates",
+        token=agent["key"],
+        base=agent["base"],
+        timeout=5,
     )
     line = body.get("line") if status == 200 and isinstance(body, dict) else None
     if line:
@@ -146,6 +152,7 @@ def checklist(given: dict[str, Any]) -> None:
             f"/me/sessions/{session_id}",
             {"todos": todos[:100], "doing": (doing or "")[:200]},
             token=agent["key"],
+            base=agent["base"],
             timeout=5,
         )
         if status == 200:
@@ -239,7 +246,7 @@ def stop(given: dict[str, Any]) -> None:
         used, nudge = _turn(kept, given)
         common.save_session(session_id, kept)
     if used:
-        common.api("POST", "/me/usage", used, token=agent["key"], timeout=5)
+        common.api("POST", "/me/usage", used, token=agent["key"], base=agent["base"], timeout=5)
     if nudge:
         print(json.dumps({"decision": "block", "reason": nudge}))
 
@@ -268,7 +275,14 @@ def session_end(given: dict[str, Any]) -> None:
     _, agent, session_id = agent_and_session(given)
     if agent is None or not session_id:
         return
-    common.api("POST", f"/me/sessions/{session_id}/close", {}, token=agent["key"], timeout=1.2)
+    common.api(
+        "POST",
+        f"/me/sessions/{session_id}/close",
+        {},
+        token=agent["key"],
+        base=agent["base"],
+        timeout=1.2,
+    )
 
 
 EVENTS = {

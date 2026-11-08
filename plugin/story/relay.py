@@ -87,10 +87,9 @@ class Relay:
         self.send({"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}})
 
     def agent(self) -> dict[str, Any] | None:
-        state = common.load_state()
-        return common.agent_here(state, self.folder) if common.base_url(state) else None
+        return common.agent_here(common.load_state(), self.folder)
 
-    def to_story(self, message: dict[str, Any], key: str) -> Any:
+    def to_story(self, message: dict[str, Any], agent: dict[str, Any]) -> Any:
         """One MCP message to Story's /mcp, as this folder's agent, in this session."""
         headers = {
             "Accept": "application/json, text/event-stream",
@@ -100,9 +99,9 @@ class Relay:
             headers["X-Story-Session"] = self.session_id
         status, body = common.call(
             "POST",
-            common.base_url() + "/mcp/",
+            agent["base"] + "/mcp/",
             message,
-            token=key,
+            token=agent["key"],
             timeout=120,
             headers=headers,
         )
@@ -133,7 +132,7 @@ class Relay:
                     self.fail(msg_id, -32601, "Story isn't joined in this folder yet.")
                 return
             try:
-                found = self.to_story(msg, agent["key"])
+                found = self.to_story(msg, agent)
             except RuntimeError as error:
                 if msg_id is not None:
                     self.answer(msg_id, text_result(str(error), error=True))
@@ -152,7 +151,7 @@ class Relay:
         if agent is None:
             return mine
         try:
-            theirs = self.to_story(msg, agent["key"]) or {}
+            theirs = self.to_story(msg, agent) or {}
         except RuntimeError as error:
             log("initialize failed", error)
             mine["instructions"] = "Story can't be reached just now; its tools will be back."
@@ -168,9 +167,7 @@ class Relay:
         if agent is None:
             return [JOIN]
         try:
-            found = self.to_story(
-                {"jsonrpc": "2.0", "id": "tools", "method": "tools/list"}, agent["key"]
-            )
+            found = self.to_story({"jsonrpc": "2.0", "id": "tools", "method": "tools/list"}, agent)
         except RuntimeError as error:
             log("tools/list failed", error)
             return [JOIN]
@@ -238,31 +235,34 @@ def _open_browser(url: str) -> None:
         subprocess.run([opener, url], capture_output=True, timeout=10)
 
 
-def _signed_in(state: dict[str, Any]) -> str | None:
-    """The person's sign-in on this computer, if it still works."""
-    token = common.get_secret(common.PERSON)
+def _signed_in(state: dict[str, Any], base: str) -> str | None:
+    """The person's sign-in to this Story on this computer, if it still works."""
+    account = common.person_account(state, base)
+    token = common.get_secret(account)
     if not token:
         return None
-    status, body = common.api("GET", "/me", token=token, state=state)
+    status, body = common.api("GET", "/me", token=token, base=base)
     if status == 200 and isinstance(body, dict):
         card = body.get("card") or {}
-        state["person"] = {"card_id": card.get("id"), "name": card.get("display_name")}
+        common.story_place(state, base)["person"] = {
+            "card_id": card.get("id"),
+            "name": card.get("display_name"),
+        }
         return token
     if status in (401, 403):
-        common.delete_secret(common.PERSON)
+        common.delete_secret(account)
     return None
 
 
-def _sign_in(state: dict[str, Any], wait: float, link: str | None = None) -> tuple:
-    """Connect this computer: a page opens in the person's browser, they say yes, and the plugin
-    holds a sign-in as them. Returns the sign-in, or None and where to approve."""
-    pending = state.get("device") or {}
+def _sign_in(state: dict[str, Any], base: str, wait: float, link: str | None = None) -> tuple:
+    """Connect this computer to this Story: a page opens in the person's browser, they say yes,
+    and the plugin holds a sign-in as them. Returns the sign-in, or None and where to approve."""
+    place = common.story_place(state, base)
+    pending = place.get("device") or {}
     if not pending or pending.get("expires", 0) < common.now():
         label = f"Claude Code on {common.computer_name()}"[:80]
         # The link it's connecting for, so the page can say which story, and the name on it.
-        status, body = common.api(
-            "POST", "/auth/device", {"label": label, "link": link}, state=state
-        )
+        status, body = common.api("POST", "/auth/device", {"label": label, "link": link}, base=base)
         if status != 201 or not isinstance(body, dict):
             raise RuntimeError(f"Story couldn't start connecting: {common.refusal(body)}")
         pending = {
@@ -272,24 +272,24 @@ def _sign_in(state: dict[str, Any], wait: float, link: str | None = None) -> tup
             "interval": body.get("interval", 3),
             "expires": common.now() + body.get("expires_in", 600),
         }
-        state["device"] = pending
+        place["device"] = pending
         common.save_state(state)
         _open_browser(pending["url"])
     until = common.now() + wait
     while True:
         status, body = common.api(
-            "POST", "/auth/device/token", {"device_code": pending["device_code"]}, state=state
+            "POST", "/auth/device/token", {"device_code": pending["device_code"]}, base=base
         )
         got = body.get("state") if isinstance(body, dict) else None
         if got == "approved" and body.get("token"):
-            common.set_secret(common.PERSON, body["token"])
+            common.set_secret(common.person_account(state, base), body["token"])
             card = body.get("card") or {}
-            state["person"] = {"card_id": card.get("id"), "name": card.get("display_name")}
-            state.pop("device", None)
+            place["person"] = {"card_id": card.get("id"), "name": card.get("display_name")}
+            place.pop("device", None)
             common.save_state(state)
             return body["token"], None
         if got in ("denied", "expired", "claimed") or status == 404:
-            state.pop("device", None)
+            place.pop("device", None)
             common.save_state(state)
             raise RuntimeError(
                 "Connecting this computer was turned down."
@@ -306,18 +306,31 @@ def join(cwd: str, folder: str, session_id: str | None, given: dict[str, Any]) -
     code, origin = _code_and_origin(link)
     state = common.load_state()
     base, preview = _find_story(origin, code)
-    if state.get("base_url") and state["base_url"] != base and not os.environ.get("STORY_URL"):
-        raise ValueError(f"This computer is connected to the Story at {state['base_url']}.")
-    state["base_url"] = base
+    here = state["folders"].get(folder)
+    if here and common.get_secret(common.agent_account(here["card_id"])) is None:
+        here = None
+    was = common.base_url(state, folder) if here else None
+    if was and was != base and not os.environ.get("STORY_URL"):
+        # A folder's agent is in one Story (2026-11-08). Taking it to another would leave the
+        # first without it.
+        raise ValueError(
+            f"This folder is already {here['name']}, in the Story at "
+            f"{common.story_name(was)}. To join the Story at {common.story_name(base)}, your "
+            "person opens Claude Code in another folder and pastes the link there."
+        )
+    if not state.get("base_url"):
+        state["base_url"] = base
     common.save_state(state)
     workspace = _workspace_title(preview)
 
-    token = _signed_in(state)
+    token = _signed_in(state, base)
     connected = token is None
     if token is None:
         # Said at once, not after a wait (Logan's first real try, 2026-11-05: a silent minute,
         # and a sign-in page he didn't expect), and with the code the page asks them to check.
-        token, pending = _sign_in(state, float(os.environ.get("STORY_SIGN_IN_WAIT", "0")), code)
+        token, pending = _sign_in(
+            state, base, float(os.environ.get("STORY_SIGN_IN_WAIT", "0")), code
+        )
         if token is None:
             return {
                 "text": (
@@ -329,7 +342,7 @@ def join(cwd: str, folder: str, session_id: str | None, given: dict[str, Any]) -
                     "Don't choose a name for yourself meanwhile: join_story asks if one is needed."
                 )
             }
-    person = (state.get("person") or {}).get("name") or "your person"
+    person = (common.story_place(state, base).get("person") or {}).get("name") or "your person"
     # Said once, the moment this computer is connected, whatever comes next.
     hello = (
         [
@@ -340,9 +353,6 @@ def join(cwd: str, folder: str, session_id: str | None, given: dict[str, Any]) -
         else []
     )
 
-    here = state["folders"].get(folder)
-    if here and common.get_secret(common.agent_account(here["card_id"])) is None:
-        here = None
     # The link is the way in (2026-11-05): one no one has taken yet, made for an agent by name,
     # names it, and Story uses that name, whatever else is given. Only this link's own name.
     named = (
@@ -387,7 +397,7 @@ def join(cwd: str, folder: str, session_id: str | None, given: dict[str, Any]) -
             "card_id": here["card_id"] if here else None,
         },
         token=token,
-        state=state,
+        base=base,
     )
     if status not in (200, 201) or not isinstance(body, dict):
         return {"text": f"Story didn't let this join: {common.refusal(body)}"}
@@ -400,6 +410,7 @@ def join(cwd: str, folder: str, session_id: str | None, given: dict[str, Any]) -
     if body.get("workspace") and body["workspace"] not in titles:
         titles.append(body["workspace"])
     kept["workspaces"] = titles
+    kept["base_url"] = base
     state["folders"][folder] = kept
     common.save_state(state)
 
@@ -419,7 +430,7 @@ def join(cwd: str, folder: str, session_id: str | None, given: dict[str, Any]) -
         # A session works in one workspace (decision 2): one already on a story stays there.
         before = common.load_session(session_id).get("story_id")
         brief = open_session(
-            cwd, session_id, key, story_id=None if before else body.get("story_id")
+            cwd, session_id, key, base=base, story_id=None if before else body.get("story_id")
         )
         if before and body.get("workspace"):
             lines.append(
@@ -453,6 +464,7 @@ def open_session(
     cwd: str,
     session_id: str,
     key: str,
+    base: str | None = None,
     story_id: str | None = None,
     woken: bool = False,
     woken_for: str | None = None,
@@ -474,7 +486,7 @@ def open_session(
         body["woken"] = True
         if woken_for:
             body["woken_for"] = woken_for
-    status, found = common.api("POST", "/me/sessions", body, token=key)
+    status, found = common.api("POST", "/me/sessions", body, token=key, base=base)
     if status == 409 and woken:
         return NOTHING_TO_DO
     if status != 200 or not isinstance(found, dict):
